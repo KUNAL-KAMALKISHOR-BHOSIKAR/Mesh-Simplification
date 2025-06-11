@@ -76,8 +76,31 @@ def get_boundary_edges(mesh):
     return boundary_edges
 
 @njit
-def estimate_curvature(p0, p1, p2):
-    return np.linalg.norm(p0 - 2 * p1 + p2)
+def estimate_curvature(p1, p2, p3):
+    # First derivatives (v' = p3 - p2)
+    x1 = p3[0] - p2[0]
+    y1 = p3[1] - p2[1]
+    z1 = p3[2] - p2[2]
+
+    # Second derivatives (v'' = p3 - 2*p1 + p2)
+    x2 = p3[0] - 2 * p1[0] + p2[0]
+    y2 = p3[1] - 2 * p1[1] + p2[1]
+    z2 = p3[2] - 2 * p1[2] + p2[2]
+
+    # Numerator: magnitude of the cross product of v' and v''
+    cross_x = z2 * y1 - y2 * z1
+    cross_y = x2 * z1 - z2 * x1
+    cross_z = y2 * x1 - x2 * y1
+    numerator = np.sqrt(cross_x**2 + cross_y**2 + cross_z**2)
+
+    # Denominator: ||v'||^3
+    denom = (x1**2 + y1**2 + z1**2)**1.5
+
+    # Avoid division by zero
+    if denom < 1e-8:
+        return 0.0
+    
+    return numerator / denom
 
 def compute_boundary_curvature(vertices, boundary_edges):
     neighbors = defaultdict(list)
@@ -87,12 +110,12 @@ def compute_boundary_curvature(vertices, boundary_edges):
 
     curvature = {}
     for v in neighbors:
-        if len(neighbors[v]) < 2:
+        if len(neighbors[v]) < 2 or len(neighbors[v]) > 2:
             curvature[v] = 0.0
             continue
-        v1, v2 = neighbors[v][:2]
-        p0, p1, p2 = vertices[v1], vertices[v], vertices[v2]
-        curvature[v] = estimate_curvature(p0, p1, p2)
+        v1, v2 = neighbors[v]
+        p2, p1, p3 = vertices[v1], vertices[v], vertices[v2]
+        curvature[v] = estimate_curvature(p1, p2, p3)
     return curvature
 
 def get_vertex_quadrics_qem4vr(mesh, vertex_attrs, Wb=5.0, Wt=1000.0):
@@ -139,7 +162,7 @@ def get_vertex_quadrics_qem4vr(mesh, vertex_attrs, Wb=5.0, Wt=1000.0):
 
     # Apply material boundary weighting
     for idx, weight in material_weights.items():
-        quadrics[idx].matrix *= weight  # Alternatively, we could add a penalty matrix instead of scaling
+        quadrics[idx].matrix *= weight
 
     return quadrics, set(boundary_map.keys()), material_boundary_vertices
 
@@ -165,6 +188,13 @@ def simplify_mesh(mesh, target_face_count, Wb=5.0, Wt=1000.0):
     mesh.compute_vertex_normals()
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
+
+    vertex_to_faces = defaultdict(list)
+
+    for tidx, tri in enumerate(triangles):
+        for vidx in tri:
+            vertex_to_faces[vidx].append(tidx)
+
     uvs = np.asarray(mesh.triangle_uvs) if mesh.has_triangle_uvs() else None
     vertex_normals = np.asarray(mesh.vertex_normals)
 
@@ -173,9 +203,13 @@ def simplify_mesh(mesh, target_face_count, Wb=5.0, Wt=1000.0):
         idx: {
             "normal": vertex_normals[idx] if len(vertex_normals) > 0 else np.zeros(3),
             "uvs": [],
+            "faces": [],
         }
         for idx in range(len(vertices))
     }
+
+    for vidx, face_list in vertex_to_faces.items():
+        vertex_attrs[vidx]["faces"] = face_list
 
     if uvs is not None:
         # Map triangle uvs to vertices
@@ -186,6 +220,8 @@ def simplify_mesh(mesh, target_face_count, Wb=5.0, Wt=1000.0):
     quadrics, boundary_vertices, material_boundary_vertices = get_vertex_quadrics_qem4vr(mesh, vertex_attrs, Wb, Wt)
     edge_map = defaultdict(int)
 
+    non_manifold_vertices = get_non_manifold_vertices(mesh)
+
     for tri in triangles:
         for i in range(3):
             u, v = sorted([tri[i], tri[(i + 1) % 3]])
@@ -195,64 +231,87 @@ def simplify_mesh(mesh, target_face_count, Wb=5.0, Wt=1000.0):
 
     for (u, v) in edge_map.keys():
         Q = quadrics[u].matrix + quadrics[v].matrix
-        try:
-            A = Q[:3, :3]
-            b = -Q[:3, 3]
-            v_bar = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            v_bar = (vertices[u] + vertices[v]) / 2
 
-        v_bar_h = np.append(v_bar, 1)
-        error = v_bar_h @ Q @ v_bar_h
-        edge_queue.add_or_update((u, v), error, v_bar)
+        v_h = np.append(vertices[v], 1)
+        u_h = np.append(vertices[u], 1)
+
+        error_u = u_h @ Q @ u_h
+        error_v = v_h @ Q @ v_h
+
+        if error_u < error_v:
+            collapse_to = u
+            u_h = np.append(vertices[u], 1)
+            error = u_h @ Q @ u_h
+        else:
+            collapse_to = v
+            v_h = np.append(vertices[v], 1)
+            error = v_h @ Q @ v_h
+
+        edge_queue.add_or_update((u, v), error, collapse_to)
 
     new_vertices = list(vertices)
     collapsed = set()
     while len(triangles) > target_face_count and not edge_queue.empty():
-        error, (u, v), v_bar = edge_queue.pop()
-        if (u in collapsed or v in collapsed or 
-            u in boundary_vertices or v in boundary_vertices or
-            u in material_boundary_vertices or v in material_boundary_vertices):
+        error, (u, v), collapse_to = edge_queue.pop()
+
+        Q = quadrics[u].matrix + quadrics[v].matrix
+
+        keep = collapse_to
+        remove = v if collapse_to == u else u
+
+        quadrics[keep].matrix = Q
+
+        if (keep in collapsed or remove in collapsed or 
+            keep in non_manifold_vertices or remove in non_manifold_vertices):
             continue
 
-        new_vertices[u] = v_bar
-        collapsed.add(v)
+        collapsed.add(remove)
 
         # Average normals
         n1 = vertex_attrs[u]["normal"]
         n2 = vertex_attrs[v]["normal"]
-        vertex_attrs[u]["normal"] = (n1 + n2) / 2
+        vertex_attrs[keep]["normal"] = (n1 + n2) / 2
 
         # Merge UVs
         uvs_u = vertex_attrs[u]["uvs"]
         uvs_v = vertex_attrs[v]["uvs"]
-        vertex_attrs[u]["uvs"] = uvs_u + uvs_v
+        merged_uvs = uvs_u + uvs_v
+        vertex_attrs[keep]["uvs"] = merged_uvs
+
+        # Check if merged vertex is now a material boundary
+        unique_uvs = {tuple(np.round(uv, 6)) for uv in merged_uvs}
+        if len(unique_uvs) > 1 and vertices[keep] not in material_boundary_vertices:
+            material_boundary_vertices.add(keep)
+            quadrics[keep] *= Wt
 
         # Remove faces with v; replace v with u elsewhere
         new_faces = []
         for tri in triangles:
             tri = list(tri)
-            if v in tri:
-                tri = [u if x == v else x for x in tri]
+            if remove in tri:
+                tri = [keep if x == remove else x for x in tri]
             if tri[0] != tri[1] and tri[1] != tri[2] and tri[2] != tri[0]:
                 new_faces.append(tri)
         triangles = new_faces
         
         neighbors = set()
         for tri in triangles:
-            if u in tri:
+            if keep in tri:
                 for i in range(3):
                     neighbors.update([tri[i], tri[(i + 1) % 3]])
-        neighbors.discard(v)
+        neighbors.discard(remove)
+        neighbors.discard(keep)
         for n in neighbors:
-            i, j = sorted([u, n])
-            Q = quadrics[i].matrix + quadrics[j].matrix
-            try:
-                v_bar = np.linalg.solve(Q[:3, :3], -Q[:3, 3])
-            except np.linalg.LinAlgError:
-                v_bar = (new_vertices[i] + new_vertices[j]) / 2
-            v_bar_h = np.append(v_bar, 1)
-            error = v_bar_h @ Q @ v_bar_h
+            i, j = sorted([keep, n])
+            Q_n = quadrics[i].matrix + quadrics[j].matrix
+            v_ih = np.append(vertices[i], 1)
+            v_jh = np.append(vertices[j], 1)
+            if (v_ih @ Q_n @ v_ih) < (v_jh @ Q_n @ v_jh):
+                v_bar = i
+            else:
+                v_bar = j
+            v_bar_h = np.append(vertices[v_bar], 1)
+            error = v_bar_h @ Q_n @ v_bar_h
             edge_queue.add_or_update((i, j), error, v_bar)
 
     # Update final attributes
@@ -287,6 +346,21 @@ def simplify_mesh(mesh, target_face_count, Wb=5.0, Wt=1000.0):
     mesh.remove_duplicated_triangles()
     mesh.remove_degenerate_triangles()
     return mesh
+
+def get_non_manifold_vertices(mesh):
+    triangles = np.asarray(mesh.triangles)
+    edge_to_faces = defaultdict(list)
+    for tidx, tri in enumerate(triangles):
+        for i in range(3):
+            u, v = sorted((tri[i], tri[(i + 1) % 3]))
+            edge_to_faces[(u, v)].append(tidx)
+    vertex_face_count = defaultdict(set)
+    for (u, v), faces in edge_to_faces.items():
+        if len(faces) > 2:
+            vertex_face_count[u].update(faces)
+            vertex_face_count[v].update(faces)
+    # Any vertex with an edge shared by more than 2 faces is non-manifold
+    return set(vertex_face_count.keys())
 
 def main():
     mesh = o3d.io.read_triangle_mesh("rocker-arm.ply")
